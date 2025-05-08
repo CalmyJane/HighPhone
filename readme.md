@@ -1,6 +1,6 @@
 # Welcome to HighPhone!
 
-![HighPhone Coverimage](/documentation/Phone.png)
+![HighPhone Coverimage](/documentation/phone.PNG)
 
 This repo contains code for PlatformIO and was developed with Visual Studio. It's code for an ESP32 that's built into an old rotary dial phone. Current features:
 
@@ -14,8 +14,8 @@ This repo contains code for PlatformIO and was developed with Visual Studio. It'
 	- upload sample
 
 
-![HighPhone Coverimage](/documentation/circuitboard.png)
-![HighPhone Coverimage](/documentation/internals.png)
+![HighPhone Coverimage](/documentation/circuitboard.PNG)
+![HighPhone Coverimage](/documentation/Internals.PNG)
 
 
 Planned Features:
