@@ -19,6 +19,7 @@ This repo contains code for PlatformIO and was developed with Visual Studio. It'
 
 
 ![HighPhone Coverimage](/documentation/circuitboard.PNG)
+![HighPhone Coverimage](/documentation/InternalsTop.PNG)
 ![HighPhone Coverimage](/documentation/Internals.PNG)
 
 
