@@ -12,6 +12,10 @@ This repo contains code for PlatformIO and was developed with Visual Studio. It'
 	- Cancel Call
 	- delete sample
 	- upload sample
+- Volume button (toggles between 3 volume levels)
+- Redial button (replays last sample)
+- Random button (plays random sample)
+- RGB-LED Indicator
 
 
 ![HighPhone Coverimage](/documentation/circuitboard.PNG)
