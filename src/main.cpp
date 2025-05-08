@@ -21,11 +21,35 @@
 #include "AudioGeneratorWAV.h"
 #include <FastLED.h>
 #include <DNSServer.h>
-
 #include <functional>
+
+// Pinout:
+// SD-Card:
+//  MOSI: 23
+//  MISO: 19
+//  SCK: 18
+//  CS: 5
+// Audio: 26 (Analog Output)
+// LED: 33 (WS2812B)
+// Rotary Dial:
+//   Pulse: 34
+//   Rotation: 35
+//   Phone Handle: 32
+// Buttons:
+//   Volume: 16
+//   Redial: 17
+//   Random: 13
+
+
 #define SD_CS_PIN 5  // Chip Select pin for SD card reader
-#define AUDIO_PIN 25 // ESP32 DAC output pin
+#define AUDIO_PIN 26 // ESP32 DAC output pin
 #define LED_PIN 33
+#define ROTARY_PULSE_PIN 22 // Rotary dial pulse pin
+#define ROTARY_ROTATION_PIN 21 // Rotary dial rotation pin
+#define PHONE_HANDLE_PIN 16 // Phone handle pin
+#define BUTTON_VOLUME_PIN 4 // Volume button pin
+#define BUTTON_REDIAL_PIN 17 // Redial button pin
+#define BUTTON_RANDOM_PIN 15 // Random button pin  
 
 
 // Configuration class
@@ -229,6 +253,25 @@ private:
             file = numbersFolder.openNextFile();
         }
         numbersFolder.close();
+
+        File systemFolder = SD.open("/system");
+        if (!systemFolder || !systemFolder.isDirectory()) {
+            Serial.println("Failed to open /system directory");
+            return;
+        }
+
+        file = systemFolder.openNextFile();
+        while (file) {
+            if (!file.isDirectory()) {
+                    String fileName = file.name();
+                    Serial.println(fileName);
+                
+            }
+            file.close();
+            file = systemFolder.openNextFile();
+        }
+
+        systemFolder.close();
     }
 };
 
@@ -1006,44 +1049,49 @@ class DialController {
 
 class WavPlayer {
   public:
-      WavPlayer() : source(NULL), output(NULL), decoder(NULL), loopEnabled(false) {}
+    WavPlayer() : source(NULL), output(NULL), decoder(NULL), loopEnabled(false) {}
 
-      void begin() {
-          source = new AudioFileSourceSD();
-          output = new AudioOutputI2S(0, 1);
-          decoder = new AudioGeneratorWAV();
-      }
+    void begin() {
+        source = new AudioFileSourceSD();
+        output = new AudioOutputI2S(0, 1);
+        // output = new AudioOutputI2S();
+        decoder = new AudioGeneratorWAV();
+    }
 
-      void playAudio(const String &filePath, bool loop = false) {
-          loopEnabled = loop;  // Set whether to loop the audio
-          currentFilePath = filePath;
-          if (decoder->isRunning()) {
-              decoder->stop();
-          }
+    void playAudio(const String &filePath, bool loop = false) {
+        loopEnabled = loop;  // Set whether to loop the audio
+        currentFilePath = filePath;
+        if (decoder->isRunning()) {
+            decoder->stop();
+        }
 
-          source->close();
-          if (source->open(filePath.c_str())) {
-              Serial.printf("Playing '%s' from SD card...\n", filePath.c_str());
-              decoder->begin(source, output);
-          } else {
-              Serial.printf("Error opening '%s'\n", filePath.c_str());
-          }
-      }
+        source->close();
+        if (source->open(filePath.c_str())) { 
+            Serial.printf("Playing '%s' from SD card...\n", filePath.c_str());
+            decoder->begin(source, output);
+        } else {
+            Serial.printf("Error opening '%s'\n", filePath.c_str());
+        }
+    }
 
-      void stop() {
-          loopEnabled = false;  // Disable looping
-          if (decoder && decoder->isRunning()) {
-              decoder->stop();
-              Serial.println("Playback stopped.");
-          }
-      }
+    void stop() {
+        loopEnabled = false;  // Disable looping
+        if (decoder && decoder->isRunning()) {
+            decoder->stop();
+            Serial.println("Playback stopped.");
+        }
+    }
 
-      void setVolume(float volume) {
-          if (output) {
-              output->SetGain(volume / 100); // Set volume (0.0 = mute, 1.0 = max)
-              Serial.printf("Volume set to %.2f\n", volume);
-          }
-      }
+    void setVolume(float volume) {
+        if (output) {
+            output->SetGain(volume / 100); // Set volume (0.0 = mute, 1.0 = max)
+            Serial.printf("Volume set to %.2f\n", volume);
+        }
+    }
+
+    void setPlaybackCompleteCallback(std::function<void()> callback) {
+        playbackCompleteCallback = callback;
+    }
 
     void loop() {
         if (decoder && decoder->isRunning()) {
@@ -1058,6 +1106,11 @@ class WavPlayer {
                     } else {
                         Serial.printf("Error reopening '%s'\n", currentFilePath.c_str());
                     }
+                } else {
+                    // Playback finished and not looping
+                    if (playbackCompleteCallback) {
+                        playbackCompleteCallback();
+                    }
                 }
             }
         }
@@ -1065,16 +1118,17 @@ class WavPlayer {
 
 
 
-      bool isPlaying() {
-          return decoder && decoder->isRunning();
-      }
+    bool isPlaying() {
+        return decoder && decoder->isRunning();
+    }
 
-  private:
-      AudioFileSourceSD *source;
-      AudioOutputI2S *output;
-      AudioGeneratorWAV *decoder;
-      bool loopEnabled;  // Track if looping is enabled
-        String currentFilePath; // Store the current file path
+private:
+    AudioFileSourceSD *source;
+    AudioOutputI2S *output;
+    AudioGeneratorWAV *decoder;
+    bool loopEnabled;  // Track if looping is enabled
+    String currentFilePath; // Store the current file path
+    std::function<void()> playbackCompleteCallback;
 };
 
 enum PhoneState {
@@ -1189,6 +1243,7 @@ class PhoneController {
     unsigned long ringDuration;
     unsigned long ringVariation;
     unsigned long actualRingDuration;
+    bool isPlayingDigitBeep;
 
     std::function<void(PhoneState, PhoneState)> stateChangeCallback;
 
@@ -1196,6 +1251,12 @@ class PhoneController {
         if (currentState != newState) {
             lastState = currentState;
             currentState = newState;
+
+            if (currentState == Dialing) {
+                // Start playing beeep.wav in loop
+                isPlayingDigitBeep = false;
+                // wavPlayer->playAudio("/system/tuten2.wav", true);
+            }
 
             if (currentState == Ringing) {
                 // Start the ringing timer
@@ -1221,13 +1282,14 @@ class PhoneController {
     void onPhoneHandleChange(bool pickedUp) {
         if (pickedUp) {
             if (currentState == Idle) {
+            // wavPlayer->playAudio("/system/beeep.wav", true);
                 transitionToState(Dialing);
             } else if (currentState == Ringing) {
                 // Incoming call is being answered
                 transitionToState(Calling);
             }
         } else {
-            if (currentState == Calling || currentState == InvalidNumber || currentState == Ringing) {
+            if (currentState == Dialing || currentState == Calling || currentState == InvalidNumber || currentState == Ringing) {
                 // Stop the WAV file if still playing
                 wavPlayer->stop();
             }
@@ -1237,8 +1299,17 @@ class PhoneController {
 
     void onDigitDialled(int digit) {
         if (currentState == Dialing) {
-            // Proceed with digit processing only if the current state is Dialing
-            transitionToState(Dialing);
+            // Stop any current playback
+            if (wavPlayer->isPlaying()) {
+                wavPlayer->stop();
+            }
+
+            // Play a random beepX.wav
+            // int randomBeepNumber = random(1, 6); // Random number between 1 and 5
+            // String beepFilePath = "/system/beep" + String(randomBeepNumber) + ".wav";
+
+            // isPlayingDigitBeep = true;
+            // wavPlayer->playAudio(beepFilePath, false); // Play once, no loop
         }
     }
 
@@ -1252,6 +1323,15 @@ class PhoneController {
             }
         }
     }
+    
+    void onPlaybackComplete() {
+        if (currentState == Dialing && isPlayingDigitBeep) {
+            // Resume playing beeep.wav in loop
+            isPlayingDigitBeep = false;
+            // wavPlayer->playAudio("/system/beeep.wav", true);
+        }
+    }
+
 
   public:
     PhoneController(int pulsePin, int rotationPin, int phoneHandlePin, SDReader* sdReader, WavPlayer* wavPlayer)
@@ -1265,15 +1345,24 @@ class PhoneController {
         dialController.setPhoneHandleCallback([this](bool pickedUp) { this->onPhoneHandleChange(pickedUp); });
         dialController.setDigitCallback([this](int digit) { this->onDigitDialled(digit); });
         dialController.setDialledCallback([this](String number) { this->onNumberDialled(number); });
+
+        
+        // Set the playback completion callback
+        wavPlayer->setPlaybackCompleteCallback([this]() {
+            this->onPlaybackComplete();
+        });
     }
 
+    bool getHandleState(){
+        return dialController.isHandlePickedUp();
+    }
 
     void setStateChangeCallback(std::function<void(PhoneState, PhoneState)> callback) {
         stateChangeCallback = callback;
     }
 
     void startCall(String number) {
-        if (currentState == Idle && !dialController.isHandlePickedUp()) {
+        if (currentState == Idle) {
             // Incoming call can only start when the phone is idle and handle is down
             incomingNumber = number; // Store the incoming number
             lastNumber = number;
@@ -1427,7 +1516,7 @@ SDReader sdReader;  // assuming CS pin is 10
 WebConfig webConfig("CJ_HP", "High1234", &sdReader);
 
 WavPlayer wavPlayer;
-PhoneController phoneController(22, 21, 15, &sdReader, &wavPlayer); // Passing wavPlayer to PhoneController
+PhoneController phoneController(ROTARY_PULSE_PIN, ROTARY_ROTATION_PIN, PHONE_HANDLE_PIN, &sdReader, &wavPlayer); // Passing wavPlayer to PhoneController
 
 // Initialize FrontLED on pin 13
 FrontLED frontLED(13);
@@ -1678,8 +1767,6 @@ String generateCustomHtml() {
     return html;
 }
 
-
-
 void applyCurrentVolume() {
     // Get the volume settings from WebConfig
     float volumeNormal = webConfig.getParamFloat("volumes_normal");
@@ -1802,6 +1889,7 @@ void onStateChange(PhoneState lastState, PhoneState newState) {
 
 //Phone front buttons
 void onButtonStateChanged(String name, bool pressed) {
+  Serial.println("Button state changed: " + name + " is " + (pressed ? "pressed" : "released"));
     if (pressed) {  // Only take action when the button is pressed, not released
         if (name == "Speaker") {
             Serial.println("Speaker button pressed.");
@@ -1828,13 +1916,17 @@ void onButtonStateChanged(String name, bool pressed) {
                 Serial.println("Redial button pressed.");
                 String lastDialedNumber = phoneController.getCurrentNumber();
                 phoneController.dialNumber(lastDialedNumber);
-                } else {
-                    Serial.println("No number to redial.");
-                }
+            } else if (phoneController.getCurrentState() == PhoneState::Idle && !phoneController.getHandleState()) {
+                Serial.println("Redial button pressed.");
+                String lastDialedNumber = phoneController.getCurrentNumber();
+                phoneController.startCall(lastDialedNumber);
+            } else {
+                Serial.println("No number to redial.");
+            }
             }
         else if (name == "Random") {
             // Random button logic
-            if (phoneController.getCurrentState() == PhoneState::Idle) {
+            if (phoneController.getCurrentState() == PhoneState::Idle && !phoneController.getHandleState()) {
                 Serial.println("Random button pressed.");
                 const auto& mappings = sdReader.getNumberMappings();
                 if (!mappings.empty()) {
@@ -1889,9 +1981,9 @@ void setup() {
     onPropertiesModified();
 
     buttonHandler.onButtonStateChanged(onButtonStateChanged);
-    buttonHandler.addButton("Speaker", 16);
-    buttonHandler.addButton("Redial", 17);
-    buttonHandler.addButton("Random", 5, true);
+    buttonHandler.addButton("Speaker", BUTTON_VOLUME_PIN);
+    buttonHandler.addButton("Redial", BUTTON_REDIAL_PIN);
+    buttonHandler.addButton("Random", BUTTON_RANDOM_PIN);
 
     // Initialize wavPlayer after SD card is ready
     wavPlayer.begin();
