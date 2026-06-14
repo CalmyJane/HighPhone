@@ -4,6 +4,8 @@
 #include <map>
 #include <Arduino.h>
 #include <cmath>
+#define FASTLED_ALLOW_INTERRUPTS 1
+#define FASTLED_INTERRUPT_RETRY_COUNT 0
 #include <FastLED.h>
 #include <functional>
 #include <string>
@@ -22,6 +24,7 @@
 #include <FastLED.h>
 #include <DNSServer.h>
 #include <functional>
+#include "AudioFileSourceBuffer.h"
 
 // Pinout:
 // SD-Card:
@@ -191,7 +194,7 @@ public:
 
     void initialize() {
         // Initialize SD card
-        if (!SD.begin(SD_CS_PIN)) {
+        if (!SD.begin(SD_CS_PIN, SPI, 16000000)) {
             Serial.println("Failed to initialize SD card");
             // Handle error, maybe enter an error state
             return;
@@ -1049,42 +1052,58 @@ class DialController {
 
 class WavPlayer {
   public:
-    WavPlayer() : source(NULL), output(NULL), decoder(NULL), loopEnabled(false) {}
+    WavPlayer() : source(NULL), buffer(NULL), output(NULL), decoder(NULL), loopEnabled(false), playNext(false) {
+        // Create a mutex to prevent both cores from accessing variables at the same time
+        audioMutex = xSemaphoreCreateMutex();
+    }
 
     void begin() {
-        source = new AudioFileSourceSD();
         output = new AudioOutputI2S(0, 1);
-        // output = new AudioOutputI2S();
         decoder = new AudioGeneratorWAV();
+        
+        // Start the audio processing task on Core 0
+        xTaskCreatePinnedToCore(
+            this->audioTaskWrapper, 
+            "AudioTask", 
+            8192,           // Stack size
+            this,           // Pass this class instance
+            configMAX_PRIORITIES - 1, // High priority
+            &audioTaskHandle, 
+            0               // Pin to Core 0
+        );
     }
 
     void playAudio(const String &filePath, bool loop = false) {
-        loopEnabled = loop;  // Set whether to loop the audio
+        xSemaphoreTake(audioMutex, portMAX_DELAY);
+        loopEnabled = loop;
         currentFilePath = filePath;
-        if (decoder->isRunning()) {
-            decoder->stop();
-        }
+        
+        stopInternal();
 
-        source->close();
-        if (source->open(filePath.c_str())) { 
+        source = new AudioFileSourceSD();
+        if (source->open(filePath.c_str())) {
             Serial.printf("Playing '%s' from SD card...\n", filePath.c_str());
-            decoder->begin(source, output);
+            buffer = new AudioFileSourceBuffer(source, 32768);
+            decoder->begin(buffer, output);
         } else {
             Serial.printf("Error opening '%s'\n", filePath.c_str());
+            delete source;
+            source = NULL;
         }
+        xSemaphoreGive(audioMutex);
     }
 
     void stop() {
-        loopEnabled = false;  // Disable looping
-        if (decoder && decoder->isRunning()) {
-            decoder->stop();
-            Serial.println("Playback stopped.");
-        }
+        xSemaphoreTake(audioMutex, portMAX_DELAY);
+        loopEnabled = false;
+        stopInternal();
+        Serial.println("Playback stopped.");
+        xSemaphoreGive(audioMutex);
     }
 
     void setVolume(float volume) {
         if (output) {
-            output->SetGain(volume / 100); // Set volume (0.0 = mute, 1.0 = max)
+            output->SetGain(volume / 100.0);
             Serial.printf("Volume set to %.2f\n", volume);
         }
     }
@@ -1094,42 +1113,81 @@ class WavPlayer {
     }
 
     void loop() {
-        if (decoder && decoder->isRunning()) {
-            if (!decoder->loop()) {
-                decoder->stop();
-                if (loopEnabled) {
-                    // Close and reopen the source file
-                    source->close();
-                    if (source->open(currentFilePath.c_str())) {
-                        // Restart playback if looping is enabled
-                        decoder->begin(source, output);
-                    } else {
-                        Serial.printf("Error reopening '%s'\n", currentFilePath.c_str());
-                    }
-                } else {
-                    // Playback finished and not looping
-                    if (playbackCompleteCallback) {
-                        playbackCompleteCallback();
-                    }
-                }
+        // This is called by the main loop. It just checks if the background task finished a file.
+        if (playNext) {
+            playNext = false;
+            if (playbackCompleteCallback) {
+                playbackCompleteCallback();
             }
         }
     }
 
-
-
     bool isPlaying() {
-        return decoder && decoder->isRunning();
+        xSemaphoreTake(audioMutex, portMAX_DELAY);
+        bool playing = decoder && decoder->isRunning();
+        xSemaphoreGive(audioMutex);
+        return playing;
     }
 
-private:
+  private:
     AudioFileSourceSD *source;
+    AudioFileSourceBuffer *buffer;
     AudioOutputI2S *output;
     AudioGeneratorWAV *decoder;
-    bool loopEnabled;  // Track if looping is enabled
-    String currentFilePath; // Store the current file path
+    bool loopEnabled;
+    String currentFilePath;
     std::function<void()> playbackCompleteCallback;
+    
+    SemaphoreHandle_t audioMutex;
+    TaskHandle_t audioTaskHandle;
+    volatile bool playNext; // Flag to tell the main loop to trigger the callback
+
+    void stopInternal() {
+        if (decoder && decoder->isRunning()) {
+            decoder->stop();
+        }
+        if (buffer) {
+            delete buffer;
+            buffer = NULL;
+        }
+        if (source) {
+            source->close();
+            delete source;
+            source = NULL;
+        }
+    }
+
+    // The FreeRTOS task that runs continuously on Core 0
+    static void audioTaskWrapper(void *parameter) {
+        WavPlayer *player = (WavPlayer *)parameter;
+        for (;;) {
+            xSemaphoreTake(player->audioMutex, portMAX_DELAY);
+            if (player->decoder && player->decoder->isRunning()) {
+                if (!player->decoder->loop()) {
+                    // Track finished playing
+                    player->decoder->stop();
+                    if (player->loopEnabled) {
+                        // Handle looping internally
+                        player->stopInternal();
+                        player->source = new AudioFileSourceSD();
+                        if (player->source->open(player->currentFilePath.c_str())) {
+                            player->buffer = new AudioFileSourceBuffer(player->source, 32768);
+                            player->decoder->begin(player->buffer, player->output);
+                        }
+                    } else {
+                        // Handle single-shot finish
+                        player->stopInternal();
+                        player->playNext = true; // Signal main thread
+                    }
+                }
+            }
+            xSemaphoreGive(player->audioMutex);
+            // Yield to allow WiFi and background tasks to run on Core 0
+            vTaskDelay(pdMS_TO_TICKS(2)); 
+        }
+    }
 };
+
 
 enum PhoneState {
     Idle,
@@ -1230,6 +1288,118 @@ class FrontLED {
     }
 };
 
+class ButtonHandler {
+public:
+    // Method to add a button with a name, pin number, and an optional inversion flag
+    void addButton(const String& name, uint8_t pin, bool inverted = false) {
+        // Configure the pin as input with internal pull-up
+        pinMode(pin, INPUT_PULLUP);
+        ButtonState state;
+        state.pin = pin;
+        state.inverted = inverted;
+        state.lastStableState = readButton(pin, inverted);
+        state.lastReading = state.lastStableState;
+        state.lastDebounceTime = millis();
+        buttons[name] = state;
+    }
+
+    // Method to set the button state changed callback
+    void onButtonStateChanged(std::function<void(String, bool)> callback) {
+        buttonCallback = callback;
+    }
+
+    // Method to update the button states; should be called in the loop()
+    void update() {
+        unsigned long currentTime = millis();
+        for (auto& pair : buttons) {
+            const String& name = pair.first;
+            ButtonState& state = pair.second;
+            bool reading = readButton(state.pin, state.inverted);
+
+            if (reading != state.lastReading) {
+                // reset the debouncing timer
+                state.lastDebounceTime = currentTime;
+            }
+
+            if ((currentTime - state.lastDebounceTime) > debounceDelay) {
+                // whatever the reading is at, it's been there for longer than the debounce delay
+                // so take it as the actual current state
+
+                if (reading != state.lastStableState) {
+                    state.lastStableState = reading;
+
+                    // Button state changed, call the callback
+                    if (buttonCallback) {
+                        buttonCallback(name, reading); // Pass the name and the new state (pressed/released)
+                    }
+                }
+            }
+
+            state.lastReading = reading;
+        }
+    }
+
+    // Method to get the current state of a button
+    bool isButtonPressed(const String& name) {
+        if (buttons.find(name) != buttons.end()) {
+            return buttons[name].lastStableState;
+        }
+        return false; // Button not found
+    }
+
+private:
+    struct ButtonState {
+        uint8_t pin;
+        bool inverted;         // Indicates if the button's logic is inverted
+        bool lastStableState;  // The last stable state
+        bool lastReading;      // The last reading from the pin
+        unsigned long lastDebounceTime;
+    };
+    
+    std::map<String, ButtonState> buttons;
+    std::function<void(String, bool)> buttonCallback;
+    const unsigned long debounceDelay = 50; // Debounce delay in milliseconds
+
+    // Helper method to read the button state, taking inversion into account
+    bool readButton(uint8_t pin, bool inverted) {
+        bool state = digitalRead(pin) == LOW;  // Buttons are active LOW due to pull-up
+        return inverted ? !state : state;      // Apply inversion if needed
+    }
+};
+
+// Define an enum to track the speaker mode
+enum SpeakerMode {
+    Silent,
+    Normal,
+    Speaker
+};
+
+SpeakerMode currentSpeakerMode = Normal; // Initialize to Normal mode by default
+
+SDReader sdReader;  // assuming CS pin is 10
+WebConfig webConfig("CJ_HP", "High1234", &sdReader);
+
+WavPlayer wavPlayer;
+
+void applyCurrentVolume() {
+    // Get the volume settings from WebConfig
+    float volumeNormal = webConfig.getParamFloat("volumes_normal");
+    float volumeSilent = webConfig.getParamFloat("volumes_silent");
+    float volumeSpeaker = webConfig.getParamFloat("volumes_speaker");
+
+    // Apply the volume based on the current speaker mode
+    if (currentSpeakerMode == Silent) {
+        wavPlayer.setVolume(volumeSilent);
+        Serial.printf("Volume set to Silent mode: %.2f\n", volumeSilent);
+    } else if (currentSpeakerMode == Normal) {
+        wavPlayer.setVolume(volumeNormal);
+        Serial.printf("Volume set to Normal mode: %.2f\n", volumeNormal);
+    } else if (currentSpeakerMode == Speaker) {
+        wavPlayer.setVolume(volumeSpeaker);
+        Serial.printf("Volume set to Speaker mode: %.2f\n", volumeSpeaker);
+    }
+}
+
 class PhoneController {
   private:
     SDReader* sdReader; 
@@ -1253,9 +1423,9 @@ class PhoneController {
             currentState = newState;
 
             if (currentState == Dialing) {
-                // Start playing beeep.wav in loop
+                // Entering Dialing: we will run the dial tone from onStateChange.
+                // Mark that we're not currently in a "beepX" one-shot.
                 isPlayingDigitBeep = false;
-                // wavPlayer->playAudio("/system/tuten2.wav", true);
             }
 
             if (currentState == Ringing) {
@@ -1297,19 +1467,19 @@ class PhoneController {
         }
     }
 
-    void onDigitDialled(int digit) {
+    void onDigitDialled(int /*digit*/) {
         if (currentState == Dialing) {
-            // Stop any current playback
+            // Interrupt the dial tone and play a short random "beepX.wav" once.
             if (wavPlayer->isPlaying()) {
                 wavPlayer->stop();
             }
 
-            // Play a random beepX.wav
-            // int randomBeepNumber = random(1, 6); // Random number between 1 and 5
-            // String beepFilePath = "/system/beep" + String(randomBeepNumber) + ".wav";
+            int randomBeepNumber = random(1, 6); // 1..5 inclusive
+            String beepFilePath = "/system/beep" + String(randomBeepNumber) + ".wav";
 
-            // isPlayingDigitBeep = true;
-            // wavPlayer->playAudio(beepFilePath, false); // Play once, no loop
+            isPlayingDigitBeep = true;
+            applyCurrentVolume(); // keep current mode's volume
+            wavPlayer->playAudio(beepFilePath, /*loop=*/false); // one-shot; on completion we resume dial tone
         }
     }
 
@@ -1325,10 +1495,11 @@ class PhoneController {
     }
     
     void onPlaybackComplete() {
+        // If a single-shot beep finished while still Dialing, resume the continuous dial tone
         if (currentState == Dialing && isPlayingDigitBeep) {
-            // Resume playing beeep.wav in loop
             isPlayingDigitBeep = false;
-            // wavPlayer->playAudio("/system/beeep.wav", true);
+            applyCurrentVolume();
+            wavPlayer->playAudio("/system/beeep.wav", /*loop=*/true); // continuous dial tone
         }
     }
 
@@ -1424,98 +1595,6 @@ class PhoneController {
 
 };
 
-class ButtonHandler {
-public:
-    // Method to add a button with a name, pin number, and an optional inversion flag
-    void addButton(const String& name, uint8_t pin, bool inverted = false) {
-        // Configure the pin as input with internal pull-up
-        pinMode(pin, INPUT_PULLUP);
-        ButtonState state;
-        state.pin = pin;
-        state.inverted = inverted;
-        state.lastStableState = readButton(pin, inverted);
-        state.lastReading = state.lastStableState;
-        state.lastDebounceTime = millis();
-        buttons[name] = state;
-    }
-
-    // Method to set the button state changed callback
-    void onButtonStateChanged(std::function<void(String, bool)> callback) {
-        buttonCallback = callback;
-    }
-
-    // Method to update the button states; should be called in the loop()
-    void update() {
-        unsigned long currentTime = millis();
-        for (auto& pair : buttons) {
-            const String& name = pair.first;
-            ButtonState& state = pair.second;
-            bool reading = readButton(state.pin, state.inverted);
-
-            if (reading != state.lastReading) {
-                // reset the debouncing timer
-                state.lastDebounceTime = currentTime;
-            }
-
-            if ((currentTime - state.lastDebounceTime) > debounceDelay) {
-                // whatever the reading is at, it's been there for longer than the debounce delay
-                // so take it as the actual current state
-
-                if (reading != state.lastStableState) {
-                    state.lastStableState = reading;
-
-                    // Button state changed, call the callback
-                    if (buttonCallback) {
-                        buttonCallback(name, reading); // Pass the name and the new state (pressed/released)
-                    }
-                }
-            }
-
-            state.lastReading = reading;
-        }
-    }
-
-    // Method to get the current state of a button
-    bool isButtonPressed(const String& name) {
-        if (buttons.find(name) != buttons.end()) {
-            return buttons[name].lastStableState;
-        }
-        return false; // Button not found
-    }
-
-private:
-    struct ButtonState {
-        uint8_t pin;
-        bool inverted;         // Indicates if the button's logic is inverted
-        bool lastStableState;  // The last stable state
-        bool lastReading;      // The last reading from the pin
-        unsigned long lastDebounceTime;
-    };
-    
-    std::map<String, ButtonState> buttons;
-    std::function<void(String, bool)> buttonCallback;
-    const unsigned long debounceDelay = 50; // Debounce delay in milliseconds
-
-    // Helper method to read the button state, taking inversion into account
-    bool readButton(uint8_t pin, bool inverted) {
-        bool state = digitalRead(pin) == LOW;  // Buttons are active LOW due to pull-up
-        return inverted ? !state : state;      // Apply inversion if needed
-    }
-};
-
-// Define an enum to track the speaker mode
-enum SpeakerMode {
-    Silent,
-    Normal,
-    Speaker
-};
-
-SpeakerMode currentSpeakerMode = Normal; // Initialize to Normal mode by default
-
-SDReader sdReader;  // assuming CS pin is 10
-WebConfig webConfig("CJ_HP", "High1234", &sdReader);
-
-WavPlayer wavPlayer;
 PhoneController phoneController(ROTARY_PULSE_PIN, ROTARY_ROTATION_PIN, PHONE_HANDLE_PIN, &sdReader, &wavPlayer); // Passing wavPlayer to PhoneController
 
 // Initialize FrontLED on pin 13
@@ -1767,25 +1846,6 @@ String generateCustomHtml() {
     return html;
 }
 
-void applyCurrentVolume() {
-    // Get the volume settings from WebConfig
-    float volumeNormal = webConfig.getParamFloat("volumes_normal");
-    float volumeSilent = webConfig.getParamFloat("volumes_silent");
-    float volumeSpeaker = webConfig.getParamFloat("volumes_speaker");
-
-    // Apply the volume based on the current speaker mode
-    if (currentSpeakerMode == Silent) {
-        wavPlayer.setVolume(volumeSilent);
-        Serial.printf("Volume set to Silent mode: %.2f\n", volumeSilent);
-    } else if (currentSpeakerMode == Normal) {
-        wavPlayer.setVolume(volumeNormal);
-        Serial.printf("Volume set to Normal mode: %.2f\n", volumeNormal);
-    } else if (currentSpeakerMode == Speaker) {
-        wavPlayer.setVolume(volumeSpeaker);
-        Serial.printf("Volume set to Speaker mode: %.2f\n", volumeSpeaker);
-    }
-}
-
 //Button pressed on website
 void handleWebButton(String buttonName) {
     if(buttonName == "cancel_call"){
@@ -1864,21 +1924,30 @@ void onStateChange(PhoneState lastState, PhoneState newState) {
         SDReader::NumberInfo info;
         if (sdReader.getNumberInfo(dialledNumber, info)) {
             // Set the normal volume for the call
-            applyCurrentVolume(); //reset volume to currently selected
+            applyCurrentVolume(); // reset volume to currently selected
             wavPlayer.playAudio(info.filePath);
         } else {
             Serial.println("Error: Number info not found");
         }
-    } else if (newState == PhoneState::InvalidNumber) {
+    }
+    else if (newState == PhoneState::InvalidNumber) {
         // Invalid number, play the notfound.wav in a loop
         applyCurrentVolume();
         wavPlayer.playAudio("/system/keinAnschluss.wav", true);
-    } else if (newState == PhoneState::Idle) {
+    }
+    else if (newState == PhoneState::Idle) {
         wavPlayer.stop();
-    } else if (newState == PhoneState::Ringing) {
+    }
+    else if (newState == PhoneState::Ringing) {
         // Use ring volume for the ringing state
         wavPlayer.setVolume(ringVolume);  // Set the volume to ring volume when ringing
         wavPlayer.playAudio("/system/ring.wav", true);
+    }
+    else if (newState == PhoneState::Dialing) {
+        // Start continuous dial tone while waiting for digits
+        applyCurrentVolume();
+        wavPlayer.stop();
+        wavPlayer.playAudio("/system/beeep.wav", true);
     }
 
     Serial.print("State changed from ");
@@ -1886,6 +1955,7 @@ void onStateChange(PhoneState lastState, PhoneState newState) {
     Serial.print(" to ");
     Serial.println(newState);
 }
+
 
 //Phone front buttons
 void onButtonStateChanged(String name, bool pressed) {
