@@ -892,7 +892,8 @@ class RotaryDial {
       bool dialing;
       unsigned long lastPulseTime;
       unsigned long lastRotationStateChange;
-      unsigned long debounceDelay;
+      unsigned long pulseDebounceDelay;
+      unsigned long rotationDebounceDelay;
       bool lastRotationState;
       bool lastPulseState;
       int dialedNumber;
@@ -905,32 +906,28 @@ class RotaryDial {
         this->dialing = false;
         this->lastPulseTime = 0;
         this->lastRotationStateChange = 0;
-        this->debounceDelay = 80; // debounce delay in milliseconds
+        this->pulseDebounceDelay = 15;
+        this->rotationDebounceDelay = 50;
         this->dialedNumber = -1;
         pinMode(pulsePin, INPUT_PULLUP);
         pinMode(rotationPin, INPUT_PULLUP);
-        // Initialize states to the actual initial state of the pins
         this->lastRotationState = digitalRead(rotationPin);
         this->lastPulseState = digitalRead(pulsePin);
     }
 
     void update() {
-        // Read current states
         bool currentRotationState = digitalRead(rotationPin);
         bool currentPulseState = digitalRead(pulsePin);
 
-        // Handle rotation state change (start/stop dialing)
-        if (currentRotationState != lastRotationState) {
+        if (currentRotationState != lastRotationState && (millis() - lastRotationStateChange) > rotationDebounceDelay) {
             lastRotationStateChange = millis();
             lastRotationState = currentRotationState;
 
             if (currentRotationState == LOW) {
-                // Dialing started
                 pulseCount = 0;
                 dialing = true;
                 dialedNumber = -1;
             } else {
-                // Dialing stopped
                 dialing = false;
                 if (pulseCount > 0) {
                     dialedNumber = (pulseCount == 10) ? 0 : pulseCount;
@@ -938,23 +935,28 @@ class RotaryDial {
             }
         }
 
-        // Debounce pulse counting
-        if (dialing && (millis() - lastPulseTime) > debounceDelay) {
-            if (currentPulseState == LOW && lastPulseState == HIGH) {
-                pulseCount++;
+        if (dialing && (millis() - lastPulseTime) > pulseDebounceDelay) {
+            if (currentPulseState != lastPulseState) {
                 lastPulseTime = millis();
+                lastPulseState = currentPulseState;
+                if (currentPulseState == LOW) {
+                    pulseCount++;
+                }
             }
-            lastPulseState = currentPulseState;
         }
     }
 
     int getNumber() {
         if (dialedNumber != -1) {
             int temp = dialedNumber;
-            dialedNumber = -1; // Reset after reading
+            dialedNumber = -1;
             return temp;
         }
         return -1;
+    }
+
+    bool isDialing() const {
+        return dialing;
     }
 };
 
@@ -979,7 +981,6 @@ class DialController {
       : rotaryDial(pulsePin, rotationPin), phoneHandlePin(phoneHandlePin), debounceDelay(debounceDelay), dialTimeout(dialTimeout) {
         this->lastHandleChangeTime = 0;
         pinMode(phoneHandlePin, INPUT_PULLUP);
-        // Initialize state to the actual initial state of the pin
         this->lastHandleState = digitalRead(phoneHandlePin);
         this->handlePickedUp = false;
         this->lastDigitTime = 0;
@@ -1002,20 +1003,17 @@ class DialController {
     }
 
     void update() {
-        // Check for handle state change with debounce
         bool currentHandleState = digitalRead(phoneHandlePin);
         if (currentHandleState != lastHandleState && (millis() - lastHandleChangeTime) > debounceDelay) {
             lastHandleChangeTime = millis();
             lastHandleState = currentHandleState;
 
             if (currentHandleState == LOW) {
-                // Handle picked up
                 handlePickedUp = true;
-                numberBuffer = ""; // Reset the buffer
+                numberBuffer = "";
             } else {
-                // Handle placed down
                 handlePickedUp = false;
-                numberBuffer = ""; // Reset the buffer
+                numberBuffer = "";
             }
 
             if (phoneHandleCallback) {
@@ -1024,7 +1022,6 @@ class DialController {
         }
 
         if (handlePickedUp) {
-            // Update the rotary dial
             rotaryDial.update();
             int digit = rotaryDial.getNumber();
             if (digit != -1) {
@@ -1032,19 +1029,18 @@ class DialController {
                     digitCallback(digit);
                 }
 
-                // Append the digit to the number buffer
                 numberBuffer += String(digit);
                 lastDigitTime = millis();
             }
 
-            // Check if number is dialled based on timeout or max digits
-            if ((numberBuffer.length() >= 2 && (millis() - lastDigitTime) > dialTimeout) || numberBuffer.length() >= 16) {
-                if (dialledCallback) {
-                    dialledCallback(numberBuffer);
-                    Serial.println(numberBuffer);
+            if (!rotaryDial.isDialing() && numberBuffer.length() > 0) {
+                if ((millis() - lastDigitTime) > dialTimeout || numberBuffer.length() >= 16) {
+                    if (dialledCallback) {
+                        dialledCallback(numberBuffer);
+                        Serial.println(numberBuffer);
+                    }
+                    numberBuffer = "";
                 }
-
-                numberBuffer = ""; // Reset after dialled
             }
         }
     }
